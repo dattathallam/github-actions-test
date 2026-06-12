@@ -3,10 +3,9 @@
 # Job graph:
 #   notify  →  build
 #
-# The notify job calls the reusable notifier which POSTs this workflow's YAML
-# content to a webhook. The build job only runs if notify succeeds (needs: notify).
-# Any failure in the webhook call — network error or HTTP 4xx/5xx — stops build
-# from executing.
+# The notify job parses this workflow file, extracts all third-party actions,
+# and POSTs them to a webhook. The build job only runs if notify succeeds.
+# Any failure in parsing or the webhook call stops build from executing.
 
 name: Main
 
@@ -19,17 +18,26 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: send this workflow's content to the webhook before anything else runs.
-  # If the webhook call fails, the build job below is automatically skipped.
+  # Gate: parse and report all third-party actions used in this workflow before
+  # any downstream jobs run. Fails fast if the webhook call fails.
   notify:
     uses: ./.github/workflows/notify-webhook.yml
     with:
       workflow-file: .github/workflows/main.yml
 
   # Downstream job — only runs when notify succeeds.
+  # Uses third-party actions intentionally so the parser has something to detect.
   build:
     needs: notify
     runs-on: self-hosted
     steps:
-      - name: Hello World
-        run: python3 -c "print('hello world')"
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run build script
+        run: python3 -c "print('build complete')"

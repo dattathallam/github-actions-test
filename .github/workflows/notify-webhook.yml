@@ -1,7 +1,7 @@
 # Reusable notifier workflow — centralized gate (Approach 2)
 #
-# Called by any workflow that wants to send its own YAML content to a webhook
-# before proceeding. Caller must pass the path to its own workflow file.
+# Parses the calling workflow file, extracts all third-party `uses:` references,
+# and POSTs the structured list to a webhook before any downstream jobs run.
 #
 # Usage in a caller workflow:
 #   jobs:
@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       webhook-url:
-        description: "HTTP endpoint to POST the workflow content to"
+        description: "HTTP endpoint to POST the extracted actions list to"
         required: false
         type: string
         default: "https://webhook.site/10cf7893-ea3c-4e9c-ad2e-bc455cef7680"
@@ -33,47 +33,89 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
-      - name: Read workflow file
-        id: read
-        shell: bash
+      - name: Parse third-party actions from workflow file
+        id: parse
+        shell: python3 {0}
         run: |
-          WORKFLOW_PATH="${{ inputs.workflow-file }}"
+          import json
+          import sys
+          import yaml
+          import os
 
-          if [ ! -f "$WORKFLOW_PATH" ]; then
-            echo "ERROR: workflow file not found at path: $WORKFLOW_PATH"
-            exit 1
-          fi
+          workflow_path = "${{ inputs.workflow-file }}"
 
-          # Base64-encode the content so YAML special characters survive JSON serialization.
-          # Use stdin redirect + tr to strip newlines — works on both macOS (BSD base64) and Linux (GNU base64).
-          CONTENT_B64=$(base64 < "$WORKFLOW_PATH" | tr -d '\n')
-          echo "content_b64=$CONTENT_B64" >> "$GITHUB_OUTPUT"
-          echo "Workflow file read successfully: $WORKFLOW_PATH"
+          if not os.path.isfile(workflow_path):
+              print(f"ERROR: workflow file not found: {workflow_path}", file=sys.stderr)
+              sys.exit(1)
 
-      - name: POST workflow content to webhook
+          with open(workflow_path) as f:
+              workflow = yaml.safe_load(f)
+
+          actions = []
+          jobs = workflow.get("jobs", {})
+
+          for job_name, job in jobs.items():
+              if not isinstance(job, dict):
+                  continue
+
+              # Reusable workflow call at the job level (uses: org/repo/.github/workflows/x.yml@ref)
+              if "uses" in job:
+                  ref = job["uses"]
+                  if not ref.startswith("./") and not ref.startswith(".\\"):
+                      actions.append({
+                          "job": job_name,
+                          "step": None,
+                          "uses": ref,
+                          "type": "reusable_workflow",
+                      })
+
+              # Step-level action references
+              for step in job.get("steps", []):
+                  if not isinstance(step, dict) or "uses" not in step:
+                      continue
+                  ref = step["uses"]
+                  if not ref.startswith("./") and not ref.startswith(".\\"):
+                      actions.append({
+                          "job": job_name,
+                          "step": step.get("name") or ref,
+                          "uses": ref,
+                          "type": "action",
+                      })
+
+          actions_json = json.dumps(actions)
+          print(f"Found {len(actions)} third-party action(s):")
+          print(json.dumps(actions, indent=2))
+
+          # Write to GITHUB_OUTPUT — value must be on one line
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"actions_json={actions_json}\n")
+              out.write(f"action_count={len(actions)}\n")
+
+      - name: POST actions list to webhook
         shell: bash
         env:
           WEBHOOK_URL: ${{ inputs.webhook-url }}
-          CONTENT_B64: ${{ steps.read.outputs.content_b64 }}
+          ACTIONS_JSON: ${{ steps.parse.outputs.actions_json }}
         run: |
           PAYLOAD=$(jq -n \
-            --arg repository  "$GITHUB_REPOSITORY" \
-            --arg run_id      "$GITHUB_RUN_ID" \
-            --arg triggered_by "$GITHUB_EVENT_NAME" \
-            --arg workflow_file "${{ inputs.workflow-file }}" \
-            --arg content_b64  "$CONTENT_B64" \
+            --arg  repository    "$GITHUB_REPOSITORY" \
+            --arg  run_id        "$GITHUB_RUN_ID" \
+            --arg  triggered_by  "$GITHUB_EVENT_NAME" \
+            --arg  workflow_file "${{ inputs.workflow-file }}" \
+            --argjson third_party_actions "$ACTIONS_JSON" \
             '{
-              repository:   $repository,
-              run_id:       $run_id,
-              triggered_by: $triggered_by,
-              workflow_file: $workflow_file,
-              content_base64: $content_b64
+              repository:           $repository,
+              run_id:               $run_id,
+              triggered_by:         $triggered_by,
+              workflow_file:        $workflow_file,
+              third_party_actions:  $third_party_actions
             }')
 
           echo "Posting to: $WEBHOOK_URL"
+          echo "Payload:"
+          echo "$PAYLOAD" | jq .
 
           # --fail: exit non-zero on HTTP 4xx/5xx so the gate blocks downstream jobs
-          # --fail-with-body: also print the response body on failure (available in curl 7.76+)
           HTTP_STATUS=$(curl \
             --silent \
             --show-error \
