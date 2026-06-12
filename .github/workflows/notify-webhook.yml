@@ -1,0 +1,90 @@
+# Reusable notifier workflow — centralized gate (Approach 2)
+#
+# Called by any workflow that wants to send its own YAML content to a webhook
+# before proceeding. Caller must pass the path to its own workflow file.
+#
+# Usage in a caller workflow:
+#   jobs:
+#     notify:
+#       uses: ./.github/workflows/notify-webhook.yml
+#       with:
+#         workflow-file: .github/workflows/main.yml
+
+name: Notify Webhook (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      workflow-file:
+        description: "Repo-relative path to the calling workflow file (e.g. .github/workflows/main.yml)"
+        required: true
+        type: string
+      webhook-url:
+        description: "HTTP endpoint to POST the workflow content to"
+        required: false
+        type: string
+        default: "https://webhook.site/10cf7893-ea3c-4e9c-ad2e-bc455cef7680"
+
+jobs:
+  notify:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Read workflow file
+        id: read
+        shell: bash
+        run: |
+          WORKFLOW_PATH="${{ inputs.workflow-file }}"
+
+          if [ ! -f "$WORKFLOW_PATH" ]; then
+            echo "ERROR: workflow file not found at path: $WORKFLOW_PATH"
+            exit 1
+          fi
+
+          # Base64-encode the content so YAML special characters survive JSON serialization.
+          # Use stdin redirect + tr to strip newlines — works on both macOS (BSD base64) and Linux (GNU base64).
+          CONTENT_B64=$(base64 < "$WORKFLOW_PATH" | tr -d '\n')
+          echo "content_b64=$CONTENT_B64" >> "$GITHUB_OUTPUT"
+          echo "Workflow file read successfully: $WORKFLOW_PATH"
+
+      - name: POST workflow content to webhook
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook-url }}
+          CONTENT_B64: ${{ steps.read.outputs.content_b64 }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg repository  "$GITHUB_REPOSITORY" \
+            --arg run_id      "$GITHUB_RUN_ID" \
+            --arg triggered_by "$GITHUB_EVENT_NAME" \
+            --arg workflow_file "${{ inputs.workflow-file }}" \
+            --arg content_b64  "$CONTENT_B64" \
+            '{
+              repository:   $repository,
+              run_id:       $run_id,
+              triggered_by: $triggered_by,
+              workflow_file: $workflow_file,
+              content_base64: $content_b64
+            }')
+
+          echo "Posting to: $WEBHOOK_URL"
+
+          # --fail: exit non-zero on HTTP 4xx/5xx so the gate blocks downstream jobs
+          # --fail-with-body: also print the response body on failure (available in curl 7.76+)
+          HTTP_STATUS=$(curl \
+            --silent \
+            --show-error \
+            --fail \
+            --write-out "%{http_code}" \
+            --output /tmp/webhook_response.txt \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL")
+
+          echo "HTTP status: $HTTP_STATUS"
+          echo "Response body:"
+          cat /tmp/webhook_response.txt

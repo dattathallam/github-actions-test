@@ -1,0 +1,35 @@
+# Main workflow — demonstrates Approach 2 (reusable workflow as centralized gate)
+#
+# Job graph:
+#   notify  →  build
+#
+# The notify job calls the reusable notifier which POSTs this workflow's YAML
+# content to a webhook. The build job only runs if notify succeeds (needs: notify).
+# Any failure in the webhook call — network error or HTTP 4xx/5xx — stops build
+# from executing.
+
+name: Main
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate: send this workflow's content to the webhook before anything else runs.
+  # If the webhook call fails, the build job below is automatically skipped.
+  notify:
+    uses: ./.github/workflows/notify-webhook.yml
+    with:
+      workflow-file: .github/workflows/main.yml
+
+  # Downstream job — only runs when notify succeeds.
+  build:
+    needs: notify
+    runs-on: self-hosted
+    steps:
+      - name: Hello World
+        run: python3 -c "print('hello world')"
