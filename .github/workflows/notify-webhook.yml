@@ -23,7 +23,7 @@ on:
         description: "HTTP endpoint to POST the extracted actions list to"
         required: false
         type: string
-        default: "https://webhook.site/10cf7893-ea3c-4e9c-ad2e-bc455cef7680"
+        default: "https://webhook.site/#!/edit/10cf7893-ea3c-4e9c-ad2e-bc455cef7680"
 
 jobs:
   notify:

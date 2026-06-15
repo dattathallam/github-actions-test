@@ -1,11 +1,7 @@
-# Main workflow — demonstrates Approach 2 (reusable workflow as centralized gate)
+# Main workflow — Approach 4 (GitHub App intercepts externally)
 #
-# Job graph:
-#   notify  →  build
-#
-# The notify job parses this workflow file, extracts all third-party actions,
-# and POSTs them to a webhook. The build job only runs if notify succeeds.
-# Any failure in parsing or the webhook call stops build from executing.
+# No notify gate job here — the GitHub App receives the push event from GHES,
+# parses this workflow's actions, and POSTs them to the webhook independently.
 
 name: Main
 
@@ -18,17 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: parse and report all third-party actions used in this workflow before
-  # any downstream jobs run. Fails fast if the webhook call fails.
-  notify:
-    uses: ./.github/workflows/notify-webhook.yml
-    with:
-      workflow-file: .github/workflows/main.yml
-
-  # Downstream job — only runs when notify succeeds.
-  # Uses third-party actions intentionally so the parser has something to detect.
   build:
-    needs: notify
     runs-on: self-hosted
     steps:
       - name: Configure tool cache path
