@@ -98,6 +98,77 @@ def _github_get(path: str, token: str) -> dict | str | None:
     resp.raise_for_status()
     return resp.json()
 
+
+def _create_check_run(repo_full_name: str, head_sha: str, token: str) -> int | None:
+    """Create an in-progress check run on the commit. Returns the check run ID."""
+    resp = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo_full_name}/check-runs",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "name":       "Action Security Evaluation",
+            "head_sha":   head_sha,
+            "status":     "in_progress",
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        timeout=15,
+        verify=False,
+    )
+    if not resp.ok:
+        log.error("Failed to create check run: %s %s", resp.status_code, resp.text)
+        return None
+    return resp.json()["id"]
+
+
+def _complete_check_run(
+    repo_full_name: str,
+    check_run_id: int,
+    token: str,
+    actions: list[dict],
+    conclusion: str = "success",   # "success" | "failure"
+    failure_reason: str | None = None,
+) -> None:
+    """Update the check run with the final result and a summary visible in the GitHub UI."""
+
+    # Build a markdown summary table of all scanned actions
+    if actions:
+        rows = "\n".join(
+            f"| `{a['uses']}` | {a['job']} | {a.get('step') or '—'} | {a['type']} |"
+            for a in actions
+        )
+        summary = (
+            f"**{len(actions)} third-party action(s) scanned**\n\n"
+            f"| Action | Job | Step | Type |\n"
+            f"|--------|-----|------|------|\n"
+            f"{rows}"
+        )
+    else:
+        summary = "No third-party actions found in the scanned workflow files."
+
+    if failure_reason:
+        summary = f"### Evaluation failed\n\n{failure_reason}\n\n---\n\n{summary}"
+
+    requests.patch(
+        f"{GITHUB_API_BASE}/repos/{repo_full_name}/check-runs/{check_run_id}",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "status":       "completed",
+            "conclusion":   conclusion,
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "output": {
+                "title":   "Action Security Evaluation",
+                "summary": summary,
+            },
+        },
+        timeout=15,
+        verify=False,
+    )
+
 # ---------------------------------------------------------------------------
 # Workflow YAML parser (same logic as notify-webhook.yml, now recursive)
 # ---------------------------------------------------------------------------
@@ -106,7 +177,7 @@ def _parse_workflow_actions(content: str, source_file: str) -> list[dict]:
     """
     Parse a workflow YAML string and return a flat list of third-party
     action/reusable-workflow references found in it.
-    Local paths (starting with ./ or .\) are excluded.
+    Local paths (starting with ./ or .\\) are excluded.
     """
     try:
         workflow = yaml.safe_load(content)
@@ -216,6 +287,7 @@ def _verify_signature(payload_bytes: bytes, sig_header: str) -> bool:
 # Flask route — receives all GHES webhook events
 # ---------------------------------------------------------------------------
 
+@app.route("/", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     payload_bytes = request.get_data()
@@ -230,10 +302,13 @@ def handle_webhook():
 
     log.info("Received event: %s", event)
 
-    if event != "push":
-        return jsonify({"status": "ignored", "event": event}), 200
+    if event == "push":
+        return _handle_push(payload)
 
-    return _handle_push(payload)
+    if event == "workflow_run" and payload.get("action") == "requested":
+        return _handle_workflow_run(payload)
+
+    return jsonify({"status": "ignored", "event": event}), 200
 
 
 def _handle_push(payload: dict):
@@ -271,6 +346,9 @@ def _handle_push(payload: dict):
     else:
         token = _get_installation_token(installation_id)
 
+    # Create a check run immediately so the UI shows "in progress"
+    check_run_id = _create_check_run(repo_full_name, ref, token)
+
     log.info("Scanning workflow files: %s", changed_workflows)
 
     all_actions = _collect_all_actions(repo_full_name, ref, token, changed_workflows)
@@ -290,6 +368,7 @@ def _handle_push(payload: dict):
         "third_party_actions": all_actions,
     }
 
+    webhook_ok = True
     try:
         resp = requests.post(
             NOTIFY_WEBHOOK_URL,
@@ -297,8 +376,111 @@ def _handle_push(payload: dict):
             timeout=10,
         )
         log.info("Webhook POST status: %s", resp.status_code)
+        resp.raise_for_status()
     except requests.RequestException as exc:
         log.error("Failed to POST to notify webhook: %s", exc)
+        webhook_ok = False
+
+    # Update the check run in the GitHub UI with the evaluation result
+    if check_run_id:
+        if webhook_ok:
+            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
+        else:
+            _complete_check_run(
+                repo_full_name, check_run_id, token, all_actions,
+                conclusion="failure",
+                failure_reason="Could not reach the security evaluation webhook.",
+            )
+
+    return jsonify({"status": "processed", "actions_found": len(all_actions)}), 200
+
+
+def _handle_workflow_run(payload: dict):
+    """
+    Handles workflow_run events with action=requested.
+    Fired when a workflow is triggered from the GitHub UI (re-run, manual dispatch)
+    or any other trigger that isn't a direct push.
+    """
+    workflow_run    = payload["workflow_run"]
+    repo_full_name  = payload["repository"]["full_name"]
+    installation_id = payload["installation"]["id"]
+    ref             = workflow_run["head_sha"]
+    actor           = workflow_run.get("actor", {}).get("login", "unknown")
+    branch          = workflow_run.get("head_branch", "")
+    workflow_file   = workflow_run.get("path", "")   # e.g. ".github/workflows/main.yml"
+    event           = workflow_run.get("event", "")  # push, workflow_dispatch, etc.
+
+    log.info(
+        "workflow_run requested by %s on %s @ %s (trigger: %s, file: %s)",
+        actor, repo_full_name, branch, event, workflow_file,
+    )
+
+    token = _get_installation_token(installation_id)
+
+    # Use the specific workflow file that triggered this run
+    workflow_files = [workflow_file] if workflow_file else []
+
+    # Fall back to scanning all workflow files if path not provided
+    if not workflow_files:
+        tree_data = _github_get(
+            f"/repos/{repo_full_name}/git/trees/{ref}?recursive=1",
+            token,
+        )
+        if tree_data:
+            workflow_files = [
+                item["path"]
+                for item in tree_data.get("tree", [])
+                if item["path"].startswith(".github/workflows/")
+                and item["path"].endswith((".yml", ".yaml"))
+            ]
+
+    # Create a check run immediately so the UI shows "in progress"
+    check_run_id = _create_check_run(repo_full_name, ref, token)
+
+    log.info("Scanning workflow files: %s", workflow_files)
+
+    all_actions = _collect_all_actions(repo_full_name, ref, token, workflow_files)
+
+    log.info("Found %d third-party action(s)", len(all_actions))
+    for a in all_actions:
+        log.info("  [%s] %s → %s", a["type"], a["job"], a["uses"])
+
+    notification = {
+        "source":              "github-app",
+        "trigger":             "workflow_run",
+        "repository":          repo_full_name,
+        "triggered_by":        actor,
+        "event":               event,
+        "branch":              branch,
+        "commit_sha":          ref,
+        "workflow_file":       workflow_file,
+        "scanned_files":       workflow_files,
+        "third_party_actions": all_actions,
+    }
+
+    webhook_ok = True
+    try:
+        resp = requests.post(
+            NOTIFY_WEBHOOK_URL,
+            json=notification,
+            timeout=10,
+        )
+        log.info("Webhook POST status: %s", resp.status_code)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.error("Failed to POST to notify webhook: %s", exc)
+        webhook_ok = False
+
+    # Update the check run in the GitHub UI with the evaluation result
+    if check_run_id:
+        if webhook_ok:
+            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
+        else:
+            _complete_check_run(
+                repo_full_name, check_run_id, token, all_actions,
+                conclusion="failure",
+                failure_reason="Could not reach the security evaluation webhook.",
+            )
 
     return jsonify({"status": "processed", "actions_found": len(all_actions)}), 200
 
