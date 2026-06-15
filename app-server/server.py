@@ -19,10 +19,14 @@ import logging
 import os
 import time
 
+from dotenv import load_dotenv
 import jwt
 import requests
 import yaml
 from flask import Flask, abort, jsonify, request
+
+# Load .env from the same directory as this file (no-op if file doesn't exist)
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ---------------------------------------------------------------------------
 # Configuration (all from environment variables — no secrets in code)
