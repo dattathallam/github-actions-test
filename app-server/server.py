@@ -43,6 +43,14 @@ GITHUB_API_BASE = f"{GITHUB_BASE_URL}/api/v3"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Blocked actions — any action whose `uses` value starts with one of these
+# prefixes will cause the evaluation to fail and the check run to go red.
+# ---------------------------------------------------------------------------
+BLOCKED_ACTION_PREFIXES: list[str] = [
+    "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+]
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -97,6 +105,36 @@ def _github_get(path: str, token: str) -> dict | str | None:
         return None
     resp.raise_for_status()
     return resp.json()
+
+
+def _evaluate_actions(actions: list[dict]) -> tuple[bool, list[dict]]:
+    """
+    Check each action against BLOCKED_ACTION_PREFIXES.
+    Returns (passed: bool, blocked_actions: list).
+    """
+    blocked = [
+        a for a in actions
+        if any(a["uses"].startswith(prefix) for prefix in BLOCKED_ACTION_PREFIXES)
+    ]
+    return (len(blocked) == 0), blocked
+
+
+def _post_to_webhook(payload: dict) -> bool:
+    """POST payload to NOTIFY_WEBHOOK_URL. Returns True on success."""
+    log.info("POSTing to webhook: %s", NOTIFY_WEBHOOK_URL)
+    try:
+        resp = requests.post(
+            NOTIFY_WEBHOOK_URL,
+            json=payload,
+            timeout=10,
+            verify=False,   # handles self-signed certs on internal networks
+        )
+        log.info("Webhook response: HTTP %s", resp.status_code)
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        log.error("Webhook POST failed: %s", exc)
+        return False
 
 
 def _create_check_run(repo_full_name: str, head_sha: str, token: str) -> int | None:
@@ -357,8 +395,8 @@ def _handle_push(payload: dict):
     for a in all_actions:
         log.info("  [%s] %s → %s", a["type"], a["job"], a["uses"])
 
-    # POST to the notify webhook
-    notification = {
+    # POST parsed actions to the webhook immediately — before evaluation
+    webhook_ok = _post_to_webhook({
         "source":              "github-app",
         "repository":          repo_full_name,
         "pushed_by":           pusher,
@@ -366,33 +404,33 @@ def _handle_push(payload: dict):
         "commit_sha":          ref,
         "scanned_files":       changed_workflows,
         "third_party_actions": all_actions,
-    }
+    })
 
-    webhook_ok = True
-    try:
-        resp = requests.post(
-            NOTIFY_WEBHOOK_URL,
-            json=notification,
-            timeout=10,
-        )
-        log.info("Webhook POST status: %s", resp.status_code)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.error("Failed to POST to notify webhook: %s", exc)
-        webhook_ok = False
+    # Evaluate against blocked action list
+    passed, blocked = _evaluate_actions(all_actions)
 
-    # Update the check run in the GitHub UI with the evaluation result
+    if not passed:
+        log.warning("Blocked actions detected: %s", [a["uses"] for a in blocked])
+
+    # Update the check run in the GitHub UI
     if check_run_id:
-        if webhook_ok:
-            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
-        else:
+        if not passed:
+            blocked_list = "\n".join(f"- `{a['uses']}` (job: {a['job']})" for a in blocked)
+            _complete_check_run(
+                repo_full_name, check_run_id, token, all_actions,
+                conclusion="failure",
+                failure_reason=f"The following actions are blocked by policy:\n{blocked_list}",
+            )
+        elif not webhook_ok:
             _complete_check_run(
                 repo_full_name, check_run_id, token, all_actions,
                 conclusion="failure",
                 failure_reason="Could not reach the security evaluation webhook.",
             )
+        else:
+            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
 
-    return jsonify({"status": "processed", "actions_found": len(all_actions)}), 200
+    return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
 
 
 def _handle_workflow_run(payload: dict):
@@ -445,7 +483,8 @@ def _handle_workflow_run(payload: dict):
     for a in all_actions:
         log.info("  [%s] %s → %s", a["type"], a["job"], a["uses"])
 
-    notification = {
+    # POST parsed actions to the webhook immediately — before evaluation
+    webhook_ok = _post_to_webhook({
         "source":              "github-app",
         "trigger":             "workflow_run",
         "repository":          repo_full_name,
@@ -456,33 +495,33 @@ def _handle_workflow_run(payload: dict):
         "workflow_file":       workflow_file,
         "scanned_files":       workflow_files,
         "third_party_actions": all_actions,
-    }
+    })
 
-    webhook_ok = True
-    try:
-        resp = requests.post(
-            NOTIFY_WEBHOOK_URL,
-            json=notification,
-            timeout=10,
-        )
-        log.info("Webhook POST status: %s", resp.status_code)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.error("Failed to POST to notify webhook: %s", exc)
-        webhook_ok = False
+    # Evaluate against blocked action list
+    passed, blocked = _evaluate_actions(all_actions)
 
-    # Update the check run in the GitHub UI with the evaluation result
+    if not passed:
+        log.warning("Blocked actions detected: %s", [a["uses"] for a in blocked])
+
+    # Update the check run in the GitHub UI
     if check_run_id:
-        if webhook_ok:
-            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
-        else:
+        if not passed:
+            blocked_list = "\n".join(f"- `{a['uses']}` (job: {a['job']})" for a in blocked)
+            _complete_check_run(
+                repo_full_name, check_run_id, token, all_actions,
+                conclusion="failure",
+                failure_reason=f"The following actions are blocked by policy:\n{blocked_list}",
+            )
+        elif not webhook_ok:
             _complete_check_run(
                 repo_full_name, check_run_id, token, all_actions,
                 conclusion="failure",
                 failure_reason="Could not reach the security evaluation webhook.",
             )
+        else:
+            _complete_check_run(repo_full_name, check_run_id, token, all_actions)
 
-    return jsonify({"status": "processed", "actions_found": len(all_actions)}), 200
+    return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -492,4 +531,8 @@ def _handle_workflow_run(payload: dict):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     log.info("Starting GitHub App webhook server on port %d", port)
+    log.info("NOTIFY_WEBHOOK_URL = %s", NOTIFY_WEBHOOK_URL)
+    log.info("GITHUB_BASE_URL    = %s", GITHUB_BASE_URL)
+    log.info("GITHUB_APP_ID      = %s", APP_ID)
+    log.info("Blocked prefixes   = %s", BLOCKED_ACTION_PREFIXES)
     app.run(host="0.0.0.0", port=port, debug=False)
