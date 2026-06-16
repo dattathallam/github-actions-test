@@ -48,7 +48,6 @@ log = logging.getLogger(__name__)
 # prefixes will cause the evaluation to fail and the check run to go red.
 # ---------------------------------------------------------------------------
 BLOCKED_ACTION_PREFIXES: list[str] = [
-    "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
 ]
 
 app = Flask(__name__)
@@ -135,6 +134,51 @@ def _post_to_webhook(payload: dict) -> bool:
     except requests.RequestException as exc:
         log.error("Webhook POST failed: %s", exc)
         return False
+
+
+def _cancel_workflow_run(repo_full_name: str, run_id: int, token: str) -> bool:
+    """Cancel a specific workflow run. Returns True if the cancel was accepted."""
+    resp = requests.post(
+        f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs/{run_id}/cancel",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=15,
+        verify=False,
+    )
+    if resp.status_code == 202:
+        log.info("Cancelled workflow run %s", run_id)
+        return True
+    log.error("Failed to cancel run %s: HTTP %s %s", run_id, resp.status_code, resp.text)
+    return False
+
+
+def _cancel_runs_for_sha(repo_full_name: str, head_sha: str, token: str) -> int:
+    """
+    Find all workflow runs triggered by a commit SHA and cancel them.
+    Waits briefly to let GitHub queue the runs before querying.
+    Returns the number of runs cancelled.
+    """
+    log.info("Waiting 3s for GitHub to queue workflow runs for %s...", head_sha)
+    time.sleep(3)
+
+    data = _github_get(
+        f"/repos/{repo_full_name}/actions/runs?head_sha={head_sha}",
+        token,
+    )
+    if not data:
+        log.warning("No workflow runs found for SHA %s", head_sha)
+        return 0
+
+    cancelled = 0
+    for run in data.get("workflow_runs", []):
+        if run["status"] in ("queued", "in_progress", "waiting"):
+            if _cancel_workflow_run(repo_full_name, run["id"], token):
+                cancelled += 1
+
+    log.info("Cancelled %d workflow run(s) for SHA %s", cancelled, head_sha)
+    return cancelled
 
 
 def _create_check_run(repo_full_name: str, head_sha: str, token: str) -> int | None:
@@ -430,6 +474,16 @@ def _handle_push(payload: dict):
         else:
             _complete_check_run(repo_full_name, check_run_id, token, all_actions)
 
+    # Cancel the workflow run if evaluation failed — stops build from executing
+    if not passed:
+        _cancel_runs_for_sha(repo_full_name, ref, token)
+
+    log.info("--- Security analysis complete. Simulating 30s analysis delay ---")
+    for remaining in range(30, 0, -5):
+        log.info("  Responding in %ds...", remaining)
+        time.sleep(5)
+    log.info("--- Delay complete. Returning response to GHES ---")
+
     return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
 
 
@@ -520,6 +574,17 @@ def _handle_workflow_run(payload: dict):
             )
         else:
             _complete_check_run(repo_full_name, check_run_id, token, all_actions)
+
+    # Cancel this specific workflow run if evaluation failed
+    if not passed:
+        run_id = payload["workflow_run"]["id"]
+        _cancel_workflow_run(repo_full_name, run_id, token)
+
+    log.info("--- Security analysis complete. Simulating 30s analysis delay ---")
+    for remaining in range(30, 0, -5):
+        log.info("  Responding in %ds...", remaining)
+        time.sleep(5)
+    log.info("--- Delay complete. Returning response to GHES ---")
 
     return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
 

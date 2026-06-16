@@ -1,7 +1,4 @@
 # Main workflow — Approach 4 (GitHub App intercepts externally)
-#
-# No notify gate job here — the GitHub App receives the push event from GHES,
-# parses this workflow's actions, and POSTs them to the webhook independently.
 
 name: Main
 
