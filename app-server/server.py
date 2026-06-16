@@ -479,9 +479,9 @@ def _handle_push(payload: dict):
         _cancel_runs_for_sha(repo_full_name, ref, token)
 
     log.info("--- Security analysis complete. Simulating 30s analysis delay ---")
-    for remaining in range(30, 0, -5):
-        log.info("  Responding in %ds...", remaining)
-        time.sleep(5)
+    # for remaining in range(30, 0, -5):
+    #     log.info("  Responding in %ds...", remaining)
+    #     time.sleep(5)
     log.info("--- Delay complete. Returning response to GHES ---")
 
     return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
@@ -580,11 +580,11 @@ def _handle_workflow_run(payload: dict):
         run_id = payload["workflow_run"]["id"]
         _cancel_workflow_run(repo_full_name, run_id, token)
 
-    log.info("--- Security analysis complete. Simulating 30s analysis delay ---")
-    for remaining in range(30, 0, -5):
-        log.info("  Responding in %ds...", remaining)
-        time.sleep(5)
-    log.info("--- Delay complete. Returning response to GHES ---")
+    # log.info("--- Security analysis complete. Simulating 30s analysis delay ---")
+    # for remaining in range(30, 0, -5):
+    #     log.info("  Responding in %ds...", remaining)
+    #     time.sleep(5)
+    # log.info("--- Delay complete. Returning response to GHES ---")
 
     return jsonify({"status": "processed", "passed": passed, "actions_found": len(all_actions)}), 200
 
