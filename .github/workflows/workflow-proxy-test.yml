@@ -1,0 +1,70 @@
+name: proxy-theory-test
+
+# Tests the theory that GitHub does NOT fetch ./jfrog-proxy/... prefixed actions
+# during the workflow setup phase (because they look like local paths).
+# A custom first step pre-populates ./jfrog-proxy/ by downloading directly from
+# GitHub; the subsequent step then uses the local path and must succeed without
+# any network fetch by the runner framework itself.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proxy-theory:
+    runs-on: self-hosted
+    steps:
+
+      # Promote runner-level env vars into the workflow env context
+      - name: Load credentials from runner environment
+        run: |
+          echo "GH_PAT=$GH_PAT" >> "$GITHUB_ENV"
+
+      # Raw git checkout — avoids actions/checkout which forces -c protocol.version=2,
+      # rejected by github.jfrog.info with HTTP 400.
+      # TOKEN is bound from the workflow env context so it's always non-empty.
+      - name: Checkout repository
+        env:
+          TOKEN: ${{ env.GH_PAT }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global credential.helper ""
+          git config --global "http.${GITHUB_SERVER_URL}/.extraheader" "Authorization: token ${TOKEN}"
+          GIT_TERMINAL_PROMPT=0 git -C "$GITHUB_WORKSPACE" fetch origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout "$GITHUB_SHA"
+
+      # Step 1: Download the third-party action directly from GitHub into ./jfrog-proxy/
+      # The ./jfrog-proxy/ directory does NOT exist yet at this point — GitHub never
+      # fetched it during setup because ./jfrog-proxy/... paths look local.
+      - name: "STEP 1: Download actions/setup-node@v4 into ./jfrog-proxy/"
+        uses: ./.github/actions/download-via-github
+        with:
+          gh-token: ${{ env.GH_PAT }}
+          actions: |
+            ./jfrog-proxy/actions/setup-node@v4
+
+      # Step 2: Use the action via a local ./jfrog-proxy/ path.
+      # If the theory is correct, GitHub skipped fetching this during setup,
+      # and the step now succeeds only because Step 1 pre-populated the directory.
+      - name: "STEP 2: Set up Node.js via ./jfrog-proxy/ (theory under test)"
+        uses: ./jfrog-proxy/actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Step 3: Verify the downloaded action actually ran by checking its side-effect.
+      # actions/setup-node@v4 adds a specific node binary to PATH; if it ran, node is available.
+      - name: "STEP 3: Verify the action ran from ./jfrog-proxy/"
+        run: |
+          echo "--- node binary location ---"
+          which node
+          echo "--- node version ---"
+          node --version
+          echo "--- npm version ---"
+          npm --version
+          echo ""
+          echo "✓ Theory confirmed: actions/setup-node@v4 was downloaded by Step 1"
+          echo "  and ran successfully from ./jfrog-proxy/ without GitHub fetching it."

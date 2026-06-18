@@ -1,0 +1,90 @@
+name: "Download Actions from GitHub"
+description: >
+  Accepts a list of ./jfrog-proxy/-prefixed action paths, strips the prefix,
+  resolves each ref to a commit SHA via the GitHub API, downloads the tarball
+  directly from codeload.github.com, and extracts it into the local
+  ./jfrog-proxy/ directory so subsequent steps can use it as a local path.
+
+inputs:
+  gh-token:
+    description: "GitHub token used to resolve refs and download tarballs"
+    required: true
+  actions:
+    description: |
+      Newline-separated list of ./jfrog-proxy/-prefixed action paths to download.
+      Example:
+        ./jfrog-proxy/actions/setup-node@v4
+        ./jfrog-proxy/actions/setup-python@v5
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download and extract each action
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        ACTIONS_LIST: ${{ inputs.actions }}
+      run: |
+        set -euo pipefail
+
+        PROXY_PREFIX="./jfrog-proxy/"
+
+        while IFS= read -r entry; do
+          # Skip blank lines
+          [[ -z "${entry// }" ]] && continue
+
+          # Strip the ./jfrog-proxy/ prefix
+          if [[ "$entry" != "${PROXY_PREFIX}"* ]]; then
+            echo "::warning::Skipping '$entry' — does not start with ${PROXY_PREFIX}"
+            continue
+          fi
+          action_ref="${entry#${PROXY_PREFIX}}"   # e.g. actions/setup-node@v4
+
+          # Split into repo_path and ref
+          if [[ "$action_ref" != *"@"* ]]; then
+            echo "::warning::Skipping '$action_ref' — missing @ref"
+            continue
+          fi
+          repo_part="${action_ref%@*}"   # actions/setup-node
+          ref="${action_ref##*@}"        # v4
+
+          # Split repo_part into owner and repo
+          owner="${repo_part%%/*}"       # actions
+          repo="${repo_part#*/}"         # setup-node
+
+          echo ""
+          echo ":: Prefetching ${owner}/${repo}@${ref}"
+
+          # Resolve the ref to a commit SHA
+          api_url="https://api.github.com/repos/${owner}/${repo}/commits/${ref}"
+          sha=$(curl -s \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${api_url}" | python3 -c "import sys, json; print(json.load(sys.stdin)['sha'])")
+
+          echo "  Resolved ${ref} → ${sha}"
+
+          local_path="${PROXY_PREFIX}${owner}/${repo}@${ref}"
+
+          if [[ -d "$local_path" ]]; then
+            echo "  Already present at ${local_path}, skipping."
+            continue
+          fi
+
+          mkdir -p "$local_path"
+
+          # Download and extract, stripping the top-level <repo>-<sha>/ directory
+          download_url="https://codeload.github.com/${owner}/${repo}/tar.gz/${sha}"
+          echo "  Downloading: ${download_url}"
+          curl -sL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "${download_url}" | tar -xz --strip-components=1 -C "$local_path"
+
+          echo "  Extracted to ${local_path}"
+        done <<< "$ACTIONS_LIST"
+
+        echo ""
+        echo "✓ Done. Contents of ./jfrog-proxy/:"
+        find ./jfrog-proxy/ -maxdepth 3 -type f -name "action.yml" | sort
