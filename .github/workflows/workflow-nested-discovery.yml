@@ -42,40 +42,47 @@ jobs:
         with:
           workflow-file: .github/workflows/workflow-nested-discovery.yml
 
-      # ASSERT: verify the parser found exactly the expected set.
-      # If any action is missing the step fails with a clear message.
-      - name: "ASSERT: verify all 3 nested actions were discovered"
+      # ASSERT: verify each action was found AND came from the expected source file.
+      # This proves the parser actually traversed local refs — not just the root workflow.
+      - name: "ASSERT: verify actions were found inside the correct local files"
         env:
-          DISCOVERED: ${{ steps.discovery.outputs.actions }}
+          SOURCES: ${{ steps.discovery.outputs.sources }}
         run: |
-          echo "=== Discovered actions ==="
-          echo "$DISCOVERED"
+          echo "=== action=source-file pairs ==="
+          echo "$SOURCES"
           echo ""
 
-          EXPECTED=(
-            "actions/cache@v4"
-            "actions/checkout@v4"
-            "actions/setup-node@v4"
-            "actions/setup-python@v5"
-            "actions/upload-artifact@v4"
-          )
+          # Format: "action=expected-source-file"
+          # Checking source file proves the parser entered the local file to find it.
+          declare -A EXPECTED
+          EXPECTED["actions/cache@v4"]=".github/actions/setup-env/action.yml"
+          EXPECTED["actions/setup-node@v4"]=".github/actions/install-tools/action.yml"
+          EXPECTED["actions/setup-python@v5"]=".github/actions/install-tools/action.yml"
+          EXPECTED["actions/upload-artifact@v4"]=".github/workflows/reusable-build.yml"
 
-          ALL_FOUND=true
-          for action in "${EXPECTED[@]}"; do
-            if echo "$DISCOVERED" | grep -qF "$action"; then
-              echo "FOUND:   $action"
+          ALL_PASS=true
+          for action in "${!EXPECTED[@]}"; do
+            expected_src="${EXPECTED[$action]}"
+            actual_line=$(echo "$SOURCES" | grep -F "${action}=")
+
+            if [ -z "$actual_line" ]; then
+              echo "FAIL [not found]:       $action"
+              ALL_PASS=false
+            elif echo "$actual_line" | grep -qF "$expected_src"; then
+              echo "PASS [correct source]:  $action  →  $expected_src"
             else
-              echo "MISSING: $action  <-- parser did not reach this level!"
-              ALL_FOUND=false
+              actual_src="${actual_line#*=}"
+              echo "FAIL [wrong source]:    $action  →  got '$actual_src', want '$expected_src'"
+              ALL_PASS=false
             fi
           done
 
           echo ""
-          if [ "$ALL_FOUND" = true ]; then
-            echo "PASS: all ${#EXPECTED[@]} expected actions were discovered across"
-            echo "      composite action levels AND the reusable workflow file."
+          if [ "$ALL_PASS" = true ]; then
+            echo "All actions discovered from the expected local files."
+            echo "Parser correctly traversed: composite actions AND reusable workflow."
           else
-            echo "FAIL: one or more actions were not discovered."
+            echo "One or more actions were missing or found in the wrong file."
             exit 1
           fi
 
