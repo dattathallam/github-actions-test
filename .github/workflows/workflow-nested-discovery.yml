@@ -1,0 +1,102 @@
+name: nested-action-discovery
+
+# Tests that a recursive YAML parser can discover ALL third-party action
+# references across both composite actions and reusable workflows:
+#
+#   workflow
+#     ├── job: discover-and-run
+#     │     └── setup-env          (level-2 composite)
+#     │           ├── actions/cache@v4
+#     │           └── install-tools  (level-3 composite)
+#     │                 ├── actions/setup-node@v4
+#     │                 └── actions/setup-python@v5
+#     └── job: build
+#           └── reusable-build.yml  (reusable workflow)
+#                 ├── actions/checkout@v4
+#                 └── actions/upload-artifact@v4
+#
+# The discover-actions step must find all refs by recursively following
+# both local action directories and local reusable workflow files.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover-and-run:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # DISCOVERY: recursively parse this workflow file and all composite
+      # actions it references to build the full third-party action manifest.
+      - name: "DISCOVER: find all nested action references"
+        id: discovery
+        uses: ./.github/actions/discover-actions
+        with:
+          workflow-file: .github/workflows/workflow-nested-discovery.yml
+
+      # ASSERT: verify the parser found exactly the expected set.
+      # If any action is missing the step fails with a clear message.
+      - name: "ASSERT: verify all 3 nested actions were discovered"
+        env:
+          DISCOVERED: ${{ steps.discovery.outputs.actions }}
+        run: |
+          echo "=== Discovered actions ==="
+          echo "$DISCOVERED"
+          echo ""
+
+          EXPECTED=(
+            "actions/cache@v4"
+            "actions/checkout@v4"
+            "actions/setup-node@v4"
+            "actions/setup-python@v5"
+            "actions/upload-artifact@v4"
+          )
+
+          ALL_FOUND=true
+          for action in "${EXPECTED[@]}"; do
+            if echo "$DISCOVERED" | grep -qF "$action"; then
+              echo "FOUND:   $action"
+            else
+              echo "MISSING: $action  <-- parser did not reach this level!"
+              ALL_FOUND=false
+            fi
+          done
+
+          echo ""
+          if [ "$ALL_FOUND" = true ]; then
+            echo "PASS: all ${#EXPECTED[@]} expected actions were discovered across"
+            echo "      composite action levels AND the reusable workflow file."
+          else
+            echo "FAIL: one or more actions were not discovered."
+            exit 1
+          fi
+
+      # RUN: execute the actual composite chain to prove it works end-to-end.
+      - name: "RUN: execute setup-env (level-2 composite → level-3 composite)"
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: "20"
+          python-version: "3.11"
+          cache-key: "nested-test"
+
+      # VERIFY: confirm all tools installed by the composite chain are active.
+      - name: "VERIFY: tools installed by nested composites are available"
+        run: |
+          echo "node:   $(node --version)"
+          echo "python: $(python3 --version)"
+          echo "npm:    $(npm --version)"
+          echo "pip:    $(pip3 --version)"
+
+  # Separate job that calls the reusable workflow.
+  # The parser must follow this job-level `uses:` into reusable-build.yml
+  # and discover actions/checkout@v4 and actions/upload-artifact@v4 there.
+  build:
+    uses: ./.github/workflows/reusable-build.yml

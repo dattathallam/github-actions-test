@@ -1,0 +1,94 @@
+name: "Discover Actions"
+description: >
+  Recursively parses a workflow file and all composite action files it
+  references (directly or transitively) to produce a deduplicated list
+  of every third-party action (owner/repo@ref) in the dependency tree.
+
+inputs:
+  workflow-file:
+    description: "Relative path to the workflow YAML file to scan (e.g. .github/workflows/my-workflow.yml)"
+    required: true
+
+outputs:
+  actions:
+    description: "Newline-separated, sorted list of discovered third-party actions"
+    value: ${{ steps.discover.outputs.actions }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Discover all action references
+      id: discover
+      shell: python3 {0}
+      env:
+        WORKFLOW_FILE: ${{ inputs.workflow-file }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        GITHUB_OUTPUT: ${{ env.GITHUB_OUTPUT }}
+      run: |
+        import os
+        import re
+        import sys
+        from pathlib import Path
+
+        workspace   = Path(os.environ["GITHUB_WORKSPACE"])
+        start_file  = workspace / os.environ["WORKFLOW_FILE"]
+        output_file = os.environ.get("GITHUB_OUTPUT", "")
+
+        # Matches any "uses: <value>" line, regardless of indentation.
+        USES_RE = re.compile(r'^\s+uses:\s+["\']?([^\s"\'#]+)["\']?', re.MULTILINE)
+
+        discovered = set()   # third-party refs: owner/repo@ref
+        visited    = set()   # absolute paths already parsed
+
+        def parse(path: Path):
+            path = path.resolve()
+            if path in visited:
+                return
+            visited.add(path)
+
+            if not path.exists():
+                print(f"  [warn] file not found, skipping: {path}", file=sys.stderr)
+                return
+
+            text = path.read_text()
+            print(f"  Scanning: {path.relative_to(workspace)}")
+
+            for ref in USES_RE.findall(text):
+                ref = ref.strip()
+
+                if ref.startswith("./"):
+                    local_path = workspace / ref.lstrip("./")
+
+                    if local_path.suffix in (".yml", ".yaml"):
+                        # Reusable workflow file — parse it directly
+                        parse(local_path)
+                    else:
+                        # Composite action directory — look for action.yml inside
+                        for candidate in ("action.yml", "action.yaml"):
+                            candidate_path = local_path / candidate
+                            if candidate_path.exists():
+                                parse(candidate_path)
+                                break
+                        else:
+                            print(f"  [warn] local action not found: {ref}", file=sys.stderr)
+
+                elif "/" in ref and "@" in ref:
+                    # Third-party action: owner/repo@ref  (skip actions/* that are
+                    # sub-paths of the same repo, e.g. docker/build-push-action/build)
+                    discovered.add(ref)
+
+        print(f"\nStarting discovery from: {os.environ['WORKFLOW_FILE']}\n")
+        parse(start_file)
+
+        sorted_actions = sorted(discovered)
+
+        print(f"\nDiscovered {len(sorted_actions)} third-party action(s):")
+        for a in sorted_actions:
+            print(f"  - {a}")
+
+        if output_file:
+            with open(output_file, "a") as f:
+                # Multi-line output must use the heredoc form
+                f.write("actions<<EOF\n")
+                f.write("\n".join(sorted_actions))
+                f.write("\nEOF\n")

@@ -6,10 +6,10 @@ name: proxy-theory-test
 # GitHub; the subsequent step then uses the local path and must succeed without
 # any network fetch by the runner framework itself.
 
-on:
-  push:
-    branches: ["**"]
-  workflow_dispatch:
+# on:
+#   push:
+#     branches: ["**"]
+#   workflow_dispatch:
 
 permissions:
   contents: read

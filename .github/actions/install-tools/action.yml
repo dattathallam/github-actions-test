@@ -1,0 +1,33 @@
+name: "Install Tools"
+description: >
+  Level-3 composite action. Sets up Node.js and Python.
+  Referenced by setup-env — not directly by the workflow.
+
+inputs:
+  node-version:
+    description: "Node.js version to install"
+    required: false
+    default: "20"
+  python-version:
+    description: "Python version to install"
+    required: false
+    default: "3.11"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Confirm installs
+      shell: bash
+      run: |
+        echo "node: $(node --version)"
+        echo "python: $(python3 --version)"
