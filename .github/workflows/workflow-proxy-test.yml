@@ -22,6 +22,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # PRE-CHECK: record whatever Node.js is already on the runner before we do anything.
+      # ubuntu-latest ships with a pre-installed node; we capture it here so we can
+      # prove STEP 2 changed it to something different.
+      - name: "PRE-CHECK: Node.js present on runner before setup-node"
+        run: |
+          echo "--- pre-existing node ---"
+          if which node > /dev/null 2>&1; then
+            echo "Found: $(node --version) at $(which node)"
+          else
+            echo "node is NOT present on this runner"
+          fi
+
       # Step 1: Download the third-party action directly from GitHub into ./jfrog-proxy/
       # The ./jfrog-proxy/ directory does NOT exist yet at this point — GitHub never
       # fetched it during setup because ./jfrog-proxy/... paths look local.
@@ -33,16 +45,16 @@ jobs:
             ./jfrog-proxy/actions/setup-node@v4
 
       # Step 2: Use the action via a local ./jfrog-proxy/ path.
-      # If the theory is correct, GitHub skipped fetching this during setup,
-      # and the step now succeeds only because Step 1 pre-populated the directory.
-      - name: "STEP 2: Set up Node.js via ./jfrog-proxy/ (theory under test)"
+      # Requesting v21.7.3 — a specific version that is NOT pre-installed on ubuntu-latest.
+      # If STEP 3 prints exactly v21.7.3, it can only have come from our downloaded action.
+      - name: "STEP 2: Set up Node.js v21.7.3 via ./jfrog-proxy/ (theory under test)"
         uses: ./jfrog-proxy/actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "21.7.3"
 
-      # Step 3: Verify the downloaded action actually ran by checking its side-effect.
-      # actions/setup-node@v4 adds a specific node binary to PATH; if it ran, node is available.
-      - name: "STEP 3: Verify the action ran from ./jfrog-proxy/"
+      # Step 3: Verify the downloaded action actually ran by asserting the exact version.
+      # v21.7.3 is not shipped on ubuntu-latest — seeing it here proves setup-node ran.
+      - name: "STEP 3: Verify v21.7.3 is active (only possible if our action ran)"
         run: |
           echo "--- node binary location ---"
           which node
@@ -51,5 +63,12 @@ jobs:
           echo "--- npm version ---"
           npm --version
           echo ""
-          echo "Theory confirmed: actions/setup-node@v4 was downloaded by Step 1"
-          echo "and ran successfully from ./jfrog-proxy/ without GitHub fetching it."
+          ACTUAL=$(node --version)
+          EXPECTED="v21.7.3"
+          if [ "$ACTUAL" = "$EXPECTED" ]; then
+            echo "PASS: node is $ACTUAL — this version is not pre-installed on ubuntu-latest."
+            echo "The action was downloaded by STEP 1 and ran successfully from ./jfrog-proxy/"
+          else
+            echo "FAIL: expected $EXPECTED but got $ACTUAL"
+            exit 1
+          fi
