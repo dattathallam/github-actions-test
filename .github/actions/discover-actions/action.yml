@@ -13,6 +13,9 @@ outputs:
   actions:
     description: "Newline-separated, sorted list of discovered third-party actions"
     value: ${{ steps.discover.outputs.actions }}
+  sources:
+    description: "Newline-separated list of 'action=source-file' pairs showing where each action was found"
+    value: ${{ steps.discover.outputs.sources }}
 
 runs:
   using: "composite"
@@ -37,7 +40,8 @@ runs:
         # Matches any "uses: <value>" line, regardless of indentation.
         USES_RE = re.compile(r'^\s+uses:\s+["\']?([^\s"\'#]+)["\']?', re.MULTILINE)
 
-        discovered = set()   # third-party refs: owner/repo@ref
+        # Maps ref → relative source file path (first file it was found in)
+        discovered = {}
         visited    = set()   # absolute paths already parsed
 
         def parse(path: Path):
@@ -50,8 +54,9 @@ runs:
                 print(f"  [warn] file not found, skipping: {path}", file=sys.stderr)
                 return
 
+            rel = path.relative_to(workspace)
             text = path.read_text()
-            print(f"  Scanning: {path.relative_to(workspace)}")
+            print(f"  Scanning: {rel}")
 
             for ref in USES_RE.findall(text):
                 ref = ref.strip()
@@ -74,9 +79,9 @@ runs:
                             print(f"  [warn] local action not found: {ref}", file=sys.stderr)
 
                 elif "/" in ref and "@" in ref:
-                    # Third-party action: owner/repo@ref  (skip actions/* that are
-                    # sub-paths of the same repo, e.g. docker/build-push-action/build)
-                    discovered.add(ref)
+                    # Third-party action: owner/repo@ref — record ref + source file
+                    if ref not in discovered:
+                        discovered[ref] = str(rel)
 
         print(f"\nStarting discovery from: {os.environ['WORKFLOW_FILE']}\n")
         parse(start_file)
@@ -85,11 +90,16 @@ runs:
 
         print(f"\nDiscovered {len(sorted_actions)} third-party action(s):")
         for a in sorted_actions:
-            print(f"  - {a}")
+            print(f"  - {a}  [found in: {discovered[a]}]")
 
         if output_file:
             with open(output_file, "a") as f:
-                # Multi-line output must use the heredoc form
+                # actions output: sorted newline-separated refs
                 f.write("actions<<EOF\n")
                 f.write("\n".join(sorted_actions))
                 f.write("\nEOF\n")
+                # sources output: action=source-file pairs for assertion
+                f.write("sources<<EOF\n")
+                for a in sorted_actions:
+                    f.write(f"{a}={discovered[a]}\n")
+                f.write("EOF\n")
