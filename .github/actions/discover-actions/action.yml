@@ -57,7 +57,8 @@ runs:
                 ref = ref.strip()
 
                 if ref.startswith("./"):
-                    local_path = workspace / ref.lstrip("./")
+                    # Strip exactly the "./" prefix (lstrip would also eat ".github")
+                    local_path = workspace / ref[2:]
 
                     if local_path.suffix in (".yml", ".yaml"):
                         # Reusable workflow file — parse it directly
